@@ -1,0 +1,3 @@
+SELECT pg_get_functiondef('public.cleanup_all_expired_vault_roles()'::regprocedure);
+
+SELECT pg_get_functiondef('public.cleanup_expired_vault_roles(text)'::regprocedure);
