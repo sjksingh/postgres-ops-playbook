@@ -1670,7 +1670,7 @@ Before escalating, gather:
 - [Extended Statistics](https://www.postgresql.org/docs/current/planner-stats.html#PLANNER-STATS-EXTENDED)
 - [ANALYZE Command](https://www.postgresql.org/docs/current/sql-analyze.html)
 - [pg_stats View](https://www.postgresql.org/docs/current/view-pg-stats.html)
-- https://dev.to/michal_cyncynatus_3a792c2/when-analyze-isnt-enough-debugging-bad-row-estimation-in-postgresql-47n6
+- [Original] (https://dev.to/michal_cyncynatus_3a792c2/when-analyze-isnt-enough-debugging-bad-row-estimation-in-postgresql-47n6)
 
 ### Visualization Tools
 - [Dalibo Plan Viewer](https://explain.dalibo.com/)
@@ -1684,8 +1684,3 @@ Before escalating, gather:
 - `pg_cron`: Scheduling for maintenance tasks
 
 ---
-
-**Document Version**: 1.0  
-**Last Updated**: 2024-12-24  
-**Maintained By**: Staff DBRE Team  
-**Review Schedule**: Quarterly
