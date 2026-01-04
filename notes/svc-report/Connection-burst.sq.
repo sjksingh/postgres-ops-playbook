@@ -1,0 +1,284 @@
+-- ==========================================
+-- AURORA CONNECTION BURST INVESTIGATION
+-- 
+-- ==========================================
+
+-- 1️⃣ OBSERVE: Historical Connection Pattern Analysis
+-- Since pg_stat_activity only shows current, we need CloudWatch or logs
+-- This shows what's CURRENTLY connected:
+
+SELECT 
+  backend_type,
+  state,
+  COUNT(*) as connection_count,
+  COUNT(*) FILTER (WHERE state = 'active') as active_count,
+  COUNT(*) FILTER (WHERE state = 'idle') as idle_count,
+  COUNT(*) FILTER (WHERE state = 'idle in transaction') as idle_in_txn_count
+FROM pg_stat_activity
+GROUP BY backend_type, state
+ORDER BY connection_count DESC;
+
+-- 2️⃣ ORIENT: Connection by Application/User
+-- Identify which app/pod is consuming connections
+
+SELECT 
+  COALESCE(NULLIF(application_name,''), '<none>') AS app,
+  usename,
+  client_addr,
+  state,
+  COUNT(*) as conn_count,
+  MIN(backend_start) as oldest_connection,
+  MAX(backend_start) as newest_connection,
+  MAX(backend_start) - MIN(backend_start) as connection_age_spread
+FROM pg_stat_activity
+WHERE backend_type = 'client backend'
+GROUP BY application_name, usename, client_addr, state
+ORDER BY conn_count DESC;
+
+-- 3️⃣ DECIDE: Identify Connection Leaks (Long-running idle connections)
+-- Slonik pools should release idle connections - if not, it's a leak
+
+SELECT 
+  pid,
+  usename,
+  COALESCE(NULLIF(application_name,''), '<none>') AS app,
+  client_addr,
+  backend_start,
+  state,
+  state_change,
+  NOW() - backend_start as connection_age,
+  NOW() - state_change as time_in_current_state,
+  query
+FROM pg_stat_activity
+WHERE backend_type = 'client backend'
+  AND state IN ('idle', 'idle in transaction')
+  AND NOW() - state_change > interval '5 minutes'  -- Adjust threshold
+ORDER BY connection_age DESC
+LIMIT 50;
+
+-- 4️⃣ ACT: Check for Connection Pool Exhaustion Pattern
+-- Group by client IP to identify which EKS pods are creating connections
+
+SELECT 
+  client_addr,
+  COUNT(*) as total_connections,
+  COUNT(*) FILTER (WHERE state = 'active') as active,
+  COUNT(*) FILTER (WHERE state = 'idle') as idle,
+  COUNT(*) FILTER (WHERE state = 'idle in transaction') as idle_in_txn,
+  MIN(backend_start) as oldest_conn,
+  ARRAY_AGG(DISTINCT usename) as users,
+  ARRAY_AGG(DISTINCT COALESCE(NULLIF(application_name,''), '<none>')) as apps
+FROM pg_stat_activity
+WHERE backend_type = 'client backend'
+  AND client_addr IS NOT NULL
+GROUP BY client_addr
+ORDER BY total_connections DESC;
+
+-- 5️⃣ BONUS: Statement Stats Analysis (Fixed round() issue)
+-- See what queries were consuming resources during the burst
+
+SELECT 
+  userid::regrole as user_role,
+  calls,
+  (total_time)::numeric(20,2) as total_ms,
+  (total_time / NULLIF(calls,0))::numeric(20,2) as avg_ms,
+  (max_time)::numeric(20,2) as max_ms,
+  rows,
+  LEFT(query, 100) as query_preview
+FROM pg_stat_statements
+WHERE calls > 100  -- Frequent queries
+ORDER BY total_time DESC
+LIMIT 20;
+
+-- ==========================================
+-- ROOT CAUSE ANALYSIS FROM YOUR DATA
+-- ==========================================
+
+/*
+📊 YOUR CURRENT STATE (2026-01-04 ~20:05 UTC):
+- Total client connections: 9 (8 idle, 1 active)
+- Spike was hours ago (~16:15-16:20) with ~95 connections
+- System has self-healed, connections dropped back to normal
+- No connection leaks detected (no long-running idle in transaction)
+
+🎯 LIKELY ROOT CAUSE: **SLOW QUERY CASCADE + POOL EXHAUSTION**
+
+Evidence from pg_stat_statements:
+1. Multiple queries averaging 5-15 SECONDS per call
+   - userid 90227: avg 8.9s, max 15.6s (500 calls)
+   - userid 90230: avg 8.1s, max 14.5s (620 calls)
+   - userid 90231: avg 9.1s, max 14.8s (453 calls)
+
+2. How this causes connection burst:
+   ┌─────────────────────────────────────────────────────┐
+   │ EKS Pod with Slonik Pool (e.g., 10 connections)     │
+   ├─────────────────────────────────────────────────────┤
+   │ 1. Request arrives, queries take 10-15 seconds      │
+   │ 2. All 10 pool connections get stuck on slow query  │
+   │ 3. New requests can't get connection from pool      │
+   │ 4. Slonik either:                                   │
+   │    a) Waits (pool exhaustion errors)                │
+   │    b) Creates new connections (if misconfigured)    │
+   │ 5. With 10+ pods × slow queries = connection spike  │
+   └─────────────────────────────────────────────────────┘
+
+3. Why you saw "unable to connect" errors:
+   - When ALL pods exhaust their pools simultaneously
+   - Total connections approach max_connections (500)
+   - New connection attempts fail OR timeout waiting
+
+-- ==========================================
+-- INVESTIGATION CHECKLIST
+-- ==========================================
+
+🔍 WHAT TO CHECK NEXT:
+
+1. **Confirm the Slow Query Hypothesis:**
+   ```sql
+   -- Find which specific query is causing the 5-15s delays
+   SELECT 
+     userid::regrole,
+     calls,
+     (total_time/1000)::numeric(10,2) as total_seconds,
+     (total_time / NULLIF(calls,0))::numeric(10,2) as avg_ms,
+     (max_time)::numeric(10,2) as max_ms,
+     rows,
+     query
+   FROM pg_stat_statements
+   WHERE (total_time / NULLIF(calls,0)) > 1000  -- avg > 1 second
+   ORDER BY avg_ms DESC
+   LIMIT 10;
+   ```
+
+2. **Check CloudWatch around spike time (16:15-16:20):**
+   - DatabaseConnections metric
+   - ReadLatency / WriteLatency spikes
+   - CPUUtilization
+   - Did slow queries cause DB CPU saturation?
+
+3. **Application Layer (EKS):**
+   ```bash
+   # Check for slow query warnings in app logs around 16:15
+   kubectl logs -l app=your-app --since=6h | grep -i "slow\|timeout\|pool"
+   
+   # Check Slonik configuration in your app
+   # Look for these settings:
+   # - maximumPoolSize: Should be ~10-20 per pod
+   # - connectionTimeout: How long to wait for connection
+   # - statementTimeout: Should match or be less than app timeout
+   ```
+
+4. **Root Cause Confirmation:**
+   
+   **Theory: Report Generation Queries at Peak Time**
+   - All top slow queries are `SELECT ... FROM reports` 
+   - These are clearly report generation queries (avg 5-15 seconds)
+   - Multiple user_ids (90227, 90230, 90231, etc.) running similar queries
+   - Likely a batch job or scheduled reports triggered at 16:15
+
+   **What probably happened:**
+   ```
+   Time: 16:15 - Multiple users/jobs start generating reports
+        ↓
+   Queries take 10-15 seconds each
+        ↓
+   All pod connection pools fill up with slow queries
+        ↓
+   New requests can't get connections → "unable to connect"
+        ↓
+   Connection count spikes as system tries to handle load
+        ↓
+   Time: 16:30 - Reports finish, connections released
+        ↓
+   System returns to normal (your current state)
+   ```
+
+5. **IMMEDIATE ACTIONS (Prevent Recurrence):**
+
+   **A. Optimize the Slow Queries:**
+   ```sql
+   -- These queries need indexes or optimization
+   -- They're doing 50K+ calls with 180-8000ms avg time
+   -- Check EXPLAIN plans for the top queries
+   
+   -- Example for the worst offender:
+   EXPLAIN (ANALYZE, BUFFERS) 
+   SELECT id, report_type, params, created_at, created_by, 
+          title, format, started_at, completed_at, result 
+   FROM reports 
+   WHERE <your_where_clause>
+   ORDER BY <your_order_by>
+   LIMIT 100;
+   ```
+
+   **B. Implement Query Timeout:**
+   ```javascript
+   // In your Slonik config
+   const pool = createPool('postgres://...', {
+     maximumPoolSize: 10,
+     statementTimeout: 30000,  // 30 seconds - kill runaway queries
+     idleTimeout: 60000,
+     connectionTimeout: 5000
+   });
+   ```
+
+   **C. Add Application-Level Protection:**
+   - Rate limit report generation requests
+   - Queue heavy reports instead of running them synchronously
+   - Add separate connection pool for reports vs. transactional queries
+
+   **D. Monitoring & Alerts:**
+   ```sql
+   -- Create alert when connections exceed threshold
+   -- CloudWatch Alarm: DatabaseConnections > 400 for 5 minutes
+   
+   -- Add this query to your monitoring dashboard:
+   SELECT 
+     COUNT(*) as total_connections,
+     COUNT(*) FILTER (WHERE state = 'active') as active,
+     COUNT(*) FILTER (WHERE wait_event_type IS NOT NULL) as waiting
+   FROM pg_stat_activity 
+   WHERE backend_type = 'client backend';
+   ```
+
+6. 
+**Post-Incident Report Template:**
+   ```markdown
+   ## Incident: Connection Spike 2026-01-04 16:15
+   
+   **Impact:** App logs showed "unable to connect to DB" errors
+   **Duration:** ~15-30 minutes
+   **Root Cause:** Slow report queries (5-15s avg) exhausted connection pools
+   
+   **Timeline:**
+   - 16:15: Connection spike begins (normal: 10 → spike: 95)
+   - 16:15-16:30: Multiple report generation queries running simultaneously
+   - 16:30: Queries complete, connections return to normal
+   
+   **Technical Deep Dive:**
+   - Report queries averaging 5-15 seconds
+   - 10+ EKS pods × 10 connections/pool = 100+ connections
+   - When queries slow, all pools exhaust, new requests fail
+   
+   **Resolution:**
+   - [ ] Optimize report queries (add indexes, rewrite)
+   - [ ] Add statement_timeout to prevent runaway queries
+   - [ ] Implement queue for heavy reports
+   - [ ] Add connection pool monitoring
+   - [ ] Create alert: connections > 80% capacity
+   
+   **Prevention:**
+   - Separate connection pools for OLTP vs. reporting
+   - Rate limiting on report generation endpoints
+   - Regular query performance review
+   ```
+
+7. **Next Steps for You:**
+
+   ✅ Run the query analysis to find exact slow query
+   ✅ Check CloudWatch for correlation with DB CPU/latency
+   ✅ Review app logs for error pattern at 16:15
+   ✅ Add EXPLAIN plans for top 5 slow queries
+   ✅ Work with dev team on query optimization
+   ✅ Implement monitoring before it happens again
+*/
