@@ -9,7 +9,7 @@
 
 ---
 
-## OODA Loop 1: Initial Discovery
+## Initial Discovery
 
 ### OBSERVE: Dead Tuple Crisis
 
@@ -322,7 +322,7 @@ lag_mb:              0.01 MB    ← Only 10 KB behind!
 flush_lag_mb:        0.008 MB   ← Only 8 KB behind!
 ```
 
-**🎉 KEY FINDING**: Despite running for 7 days, Debezium replication is **HEALTHY** and keeping up in real-time. This is NOT blocking VACUUM!
+**KEY FINDING**: Despite running for 7 days, Debezium replication is **HEALTHY** and keeping up in real-time. This is NOT blocking VACUUM!
 
 ```sql
 -- Check transaction age (wraparound risk)
